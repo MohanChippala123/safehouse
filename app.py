@@ -935,6 +935,11 @@ def _parse_request_body() -> dict[str, Any]:
     return request.get_json(silent=True) or {}
 
 
+def _error_response(message: str, status: int = 400) -> tuple[dict[str, str], int]:
+    """Generate error response tuple."""
+    return jsonify({"error": message}), status
+
+
 def parse_analyze_url() -> str:
     try:
         return normalize_url(_parse_request_body().get("url") or "")
@@ -948,12 +953,13 @@ def index():
 
 
 @app.route("/analyze/chain", methods=["POST"])
-def analyze_chain():
+def analyze_chain() -> tuple[Any, int]:
+    """Analyze URL redirect chain without external intel."""
     try:
         url = parse_analyze_url()
     except ValueError as exc:
         logger.warning(f"Invalid URL submitted: {exc}")
-        return jsonify({"error": str(exc)}), 400
+        return _error_response(str(exc))
 
     now = time.time()
     cached_result = RESULT_CACHE.get(url)
@@ -998,12 +1004,14 @@ def analyze_chain():
 
 
 @app.route("/analyze/intel", methods=["POST"])
-def analyze_intel():
+def analyze_intel() -> tuple[Any, int]:
+    """Get VirusTotal and URLscan intelligence for URL."""
     body = _parse_request_body()
     try:
         url = normalize_url(body.get("url") or "")
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        logger.warning(f"Invalid URL in /analyze/intel: {exc}")
+        return _error_response(str(exc))
 
     if not bool_value(body.get("external_intel"), True):
         return jsonify({"virustotal": {"available": False}, "urlscan": {"available": False}})
@@ -1017,12 +1025,14 @@ def analyze_intel():
 
 
 @app.route("/analyze/ai", methods=["POST"])
-def analyze_ai():
+def analyze_ai() -> tuple[Any, int]:
+    """Get AI-powered threat assessment for URL."""
     body = _parse_request_body()
     try:
         url = normalize_url(body.get("url") or "")
     except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        logger.warning(f"Invalid URL in /analyze/ai: {exc}")
+        return _error_response(str(exc))
 
     if not bool_value(body.get("external_intel"), True):
         return jsonify({"ai_analysis": {"available": False}})
@@ -1034,13 +1044,14 @@ def analyze_ai():
 
 
 @app.route("/analyze", methods=["POST"])
-def analyze():
+def analyze() -> tuple[Any, int]:
+    """Complete analysis: chain + intel + AI."""
     body = _parse_request_body()
     try:
         url = normalize_url(body.get("url") or "")
     except ValueError as exc:
         logger.warning(f"Invalid URL submitted: {exc}")
-        return jsonify({"error": str(exc)}), 400
+        return _error_response(str(exc))
 
     now = time.time()
     cached_result = RESULT_CACHE.get(url)
@@ -1095,14 +1106,16 @@ def analyze():
 
 
 @app.route("/urlscan-result/<scan_id>")
-def urlscan_result_route(scan_id):
+def urlscan_result_route(scan_id: str) -> tuple[Any, int]:
+    """Poll URLscan.io result status."""
     if not _RE_SCAN_ID.fullmatch(scan_id):
-        return jsonify({"error": "Invalid urlscan id"}), 400
+        return _error_response("Invalid urlscan id")
     return jsonify(urlscan_result(scan_id))
 
 
 @app.route("/urlscan-screenshot/<scan_id>")
-def urlscan_screenshot_route(scan_id):
+def urlscan_screenshot_route(scan_id: str) -> tuple[Any, int]:
+    """Proxy URLscan.io screenshot (CORS bypass)."""
     if not _RE_SCAN_ID.fullmatch(scan_id):
         return jsonify({"error": "Invalid urlscan id"}), 400
     if not URLSCAN_KEY:
@@ -1117,7 +1130,8 @@ def urlscan_screenshot_route(scan_id):
 
 
 @app.route("/analyze-file", methods=["POST"])
-def analyze_file():
+def analyze_file() -> tuple[Any, int]:
+    """Analyze file for metadata and privacy risks."""
     if "file" not in request.files:
         logger.warning("File upload attempted with no file")
         return jsonify({"error": "No file uploaded"}), 400
