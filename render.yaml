@@ -1,16 +1,40 @@
 services:
   - type: web
-    name: sentinelscope
+    name: safehouse
     runtime: python
-    plan: free
+    plan: standard
+
+    # Build configuration
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 4 --worker-class sync --worker-connections 1000 --timeout 120 --access-logfile - --error-logfile -
+
+    # Environment
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.10
+      - key: FLASK_ENV
+        value: production
+      - key: FLASK_DEBUG
+        value: "0"
+
+      # External API Keys (keep sync: false to require manual setup)
       - key: VT_API_KEY
         sync: false
       - key: URLSCAN_KEY
         sync: false
       - key: GROQ_KEY
         sync: false
+
+      # Performance tuning
+      - key: CACHE_TTL
+        value: 300
+      - key: MAX_HOPS
+        value: "10"
+
+    # Resource limits
+    scaling:
+      minInstances: 1
+      maxInstances: 3
+
+    # Health check
+    healthCheckPath: /

@@ -1,7 +1,51 @@
+# Environment
 .env
+.env.local
+.env.*.local
+
+# Python
 *.pyc
+*.pyo
+*.egg-info/
 __pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
 .venv/
 venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
 *.log
+logs/
+
+# Temporary files
+*.tmp
+*.bak
+.temp/
+
+# Build artifacts
+dist/
+build/
+*.egg
+
+# Claude Code
 .claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore

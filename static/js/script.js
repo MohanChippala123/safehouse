@@ -8,6 +8,27 @@ const SCREENSHOT_POLL_MS = 5000
 const SCREENSHOT_POLL_MAX_MS = 4 * 60 * 1000
 const URLSCAN_POLL_MS = 5000
 const URLSCAN_POLL_MAX_ATTEMPTS = 60
+const HISTORY_KEY = 'sentinelscope_history'
+const HISTORY_MAX = 50
+
+function loadHistoryFromStorage() {
+  try {
+    const stored = localStorage.getItem(HISTORY_KEY)
+    if (stored) {
+      const parsed = JSON.parse(stored)
+      if (Array.isArray(parsed)) {
+        historyItems.push(...parsed.slice(0, HISTORY_MAX))
+        renderHistory()
+      }
+    }
+  } catch (err) {}
+}
+
+function saveHistoryToStorage() {
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(historyItems.slice(0, HISTORY_MAX)))
+  } catch (err) {}
+}
 
 function clearPollTimers() {
   if (screenshotPollTimer) { clearInterval(screenshotPollTimer); screenshotPollTimer = null }
@@ -83,6 +104,8 @@ function closeSidebar() {
   document.getElementById('sidebar').classList.remove('open')
   document.getElementById('overlay').classList.remove('show')
 }
+
+loadHistoryFromStorage()
 
 function initCanvas() {
   const canvas = document.getElementById('bgCanvas')
@@ -244,16 +267,15 @@ async function analyze() {
     }
 
     if (chainData.cached) {
-      const fullRes = await postJson('/analyze', { url })
-      chainData = await readJson(fullRes)
-      if (chainData.error) {
-        showError(chainData.error)
-        finishUrlAnalyze()
-        return
-      }
-      _frontCache[cacheKey] = { ts: Date.now(), data: chainData }
       addHistory(url, chainData.overall_risk)
-      renderUrlResults(chainData, true)
+      const merged = {
+        ...chainData,
+        virustotal: chainData.virustotal || {available: false},
+        urlscan: chainData.urlscan || {available: false},
+        ai_analysis: chainData.ai_analysis || {available: false},
+      }
+      _frontCache[cacheKey] = { ts: Date.now(), data: merged }
+      renderUrlResults(merged, true)
       finishUrlAnalyze()
       return
     }
@@ -561,6 +583,7 @@ function renderGraph(g) {
     nodes.forEach(n => els.push({ data: { id: n.id, label: n.label, detail: n.detail || '' },
       style: { 'background-color': n.risk === 'high' ? '#ef4444' : (kindColor[n.kind] || '#8a8880') } }))
     ;(g.edges || []).forEach((e, i) => els.push({ data: { id: 'e' + i, source: e.source, target: e.target, label: e.rel, danger: e.danger ? 1 : 0 } }))
+    const nodeRepulsion = Math.max(4000, 6000 * (8 / Math.max(nodes.length, 1)))
     _cy = cytoscape({
       container: canvas,
       elements: els,
@@ -574,7 +597,7 @@ function renderGraph(g) {
           'arrow-scale': 0.7, 'text-rotation': 'autorotate' } },
         { selector: 'edge[danger = 1]', style: { 'line-color': '#ef4444', 'target-arrow-color': '#ef4444', 'width': 2, 'color': '#ef4444' } },
       ],
-      layout: { name: 'cose', animate: false, padding: 20, nodeRepulsion: 6000, idealEdgeLength: 70 },
+      layout: { name: 'cose', animate: false, padding: 20, nodeRepulsion: nodeRepulsion, idealEdgeLength: 70 },
     })
     _cy.on('tap', 'node', evt => {
       const d = evt.target.data('detail')
@@ -679,9 +702,9 @@ function renderScreenshot(us) {
   if (us.ready) return
 
   const started = Date.now()
+  let pollCount = 0
   const attempt = () => {
     if (Date.now() - started >= SCREENSHOT_POLL_MAX_MS) {
-      stopScreenshotPoll()
       const href = reportLink.href && reportLink.href !== '#' ? reportLink.href : ''
       loading.innerHTML = href
         ? 'Screenshot not ready yet. <a class="screenshot-link" href="' + href + '" target="_blank">Open urlscan report</a>'
@@ -692,17 +715,19 @@ function renderScreenshot(us) {
     }
     const probe = new Image()
     probe.onload = () => {
-      stopScreenshotPoll()
       img.onerror = null
       img.onload = showImage
       img.src = probe.src
     }
-    probe.onerror = () => {}
+    probe.onerror = () => {
+      pollCount++
+      const pollInterval = Math.min(2000 * Math.pow(1.3, pollCount), 15000)
+      screenshotPollTimer = setTimeout(attempt, pollInterval)
+    }
     probe.src = bustUrl(src)
   }
 
   attempt()
-  screenshotPollTimer = setInterval(attempt, SCREENSHOT_POLL_MS)
 }
 
 function renderAI(ai) {
@@ -1051,12 +1076,14 @@ function addHistory(url, score) {
   const short = url.replace(/^https?:\/\//,'').slice(0,26)
   historyItems.unshift({url, level, short, type: 'url'})
   renderHistory()
+  saveHistoryToStorage()
 }
 
 function addHistoryFile(name, score) {
   const level = score === 0 ? 'clean' : score < 25 ? 'low' : score < 55 ? 'medium' : 'high'
   historyItems.unshift({label: name.slice(0,26), level, type: 'file'})
   renderHistory()
+  saveHistoryToStorage()
 }
 
 function renderHistory() {

@@ -4,6 +4,7 @@ import base64
 import datetime as dt
 import ipaddress
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -27,6 +28,12 @@ from werkzeug.utils import secure_filename
 from sh_engine import assemble_graph, build_timeline, build_verdict, deobfuscate, detect_typosquat, extract_image_metadata, trace_credentials
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 try:
     import whois as whois_lib
@@ -73,7 +80,7 @@ MAX_HOPS = 10
 # FIX 4 (cont.): Replace bare dicts with bounded caches.
 # The old code had no eviction policy at all — every unique IP, hostname, and
 # URL would accumulate forever, leaking memory in long-running workers.
-LOOKUP_CACHE: dict[str, dict] = {}
+LOOKUP_CACHE: dict[str, tuple[float, dict]] = {}
 RESULT_CACHE: dict[str, tuple[float, dict]] = {}
 
 REDIRECTS = {301, 302, 303, 307, 308}
@@ -138,37 +145,51 @@ OOXML_NS = {
 # each call; this set lets us skip the inner loop for non-sensitive fields.
 _ALL_SENSITIVE_FIELDS: set[str] = {f for fields in SENSITIVE_FIELDS.values() for f in fields}
 
+_APEX_CACHE: dict[str, str] = {}
+
 
 def _evict_lookup_cache() -> None:
-    """Drop oldest half of LOOKUP_CACHE when it exceeds the cap."""
+    """Drop stale or oldest entries from LOOKUP_CACHE when it exceeds the cap."""
+    now = time.time()
+    stale = [k for k, (ts, _) in LOOKUP_CACHE.items() if now - ts >= CACHE_TTL]
+    for k in stale:
+        LOOKUP_CACHE.pop(k, None)
     if len(LOOKUP_CACHE) >= _MAX_LOOKUP_CACHE:
-        # dict preserves insertion order in Python 3.7+; drop the first half.
-        drop = list(LOOKUP_CACHE)[:_MAX_LOOKUP_CACHE // 2]
-        for k in drop:
-            LOOKUP_CACHE.pop(k, None)
+        oldest = min(LOOKUP_CACHE.items(), key=lambda x: x[1][0])
+        LOOKUP_CACHE.pop(oldest[0], None)
 
 
 def _evict_result_cache() -> None:
-    """Drop expired entries, then oldest entries if still over cap."""
+    """Drop expired entries, then oldest entry if still over cap."""
     now = time.time()
     expired = [k for k, (ts, _) in RESULT_CACHE.items() if now - ts >= CACHE_TTL]
     for k in expired:
         RESULT_CACHE.pop(k, None)
     if len(RESULT_CACHE) >= _MAX_RESULT_CACHE:
-        drop = list(RESULT_CACHE)[: len(RESULT_CACHE) - _MAX_RESULT_CACHE + 1]
-        for k in drop:
-            RESULT_CACHE.pop(k, None)
+        oldest = min(RESULT_CACHE.items(), key=lambda x: x[1][0])
+        RESULT_CACHE.pop(oldest[0], None)
 
 
 def cached(key: str, fn):
     if key not in LOOKUP_CACHE:
         _evict_lookup_cache()
-        LOOKUP_CACHE[key] = fn()
-    return LOOKUP_CACHE[key]
+        LOOKUP_CACHE[key] = (time.time(), fn())
+    return LOOKUP_CACHE[key][1]
 
 
 def bool_value(value, default=True) -> bool:
     return default if value is None else str(value).lower() not in {"0", "false", "off", "no"}
+
+
+def _get_apex(hostname: str) -> str:
+    """Extract apex domain (e.g., example.com from sub.example.com) with caching."""
+    if hostname in _APEX_CACHE:
+        return _APEX_CACHE[hostname]
+    host = hostname.lower().strip(".")
+    parts = host.split(".")
+    apex = ".".join(parts[-2:]) if len(parts) >= 2 else host
+    _APEX_CACHE[hostname] = apex
+    return apex
 
 
 def domain_in(hostname: str, domains: set[str]) -> bool:
@@ -238,10 +259,11 @@ def get_tls_info(hostname: str) -> dict:
 
 def get_domain_age(hostname: str) -> dict:
     default = {"age_days": -1, "registrar": "unknown"}
-    parts = hostname.rstrip(".").split(".")
-    if len(parts) < 2 or whois_lib is None:
+    if whois_lib is None:
         return default
-    apex = ".".join(parts[-2:])
+    apex = _get_apex(hostname)
+    if not apex or apex.count(".") < 1:
+        return default
 
     def lookup():
         try:
@@ -251,7 +273,7 @@ def get_domain_age(hostname: str) -> dict:
                 created = dt.datetime.combine(created, dt.time.min)
             if not isinstance(created, dt.datetime):
                 return default
-            return {"age_days": (dt.datetime.utcnow() - created.replace(tzinfo=None)).days, "registrar": (data.registrar or "unknown").lower()}
+            return {"age_days": (dt.datetime.now(dt.timezone.utc) - created.replace(tzinfo=None)).days, "registrar": (data.registrar or "unknown").lower()}
         except Exception:
             return default
 
@@ -731,10 +753,15 @@ def normalize_url(url: str) -> str:
     url = url.strip()
     if not url:
         raise ValueError("No URL provided.")
+    if len(url) > 2048:
+        raise ValueError("URL exceeds maximum length (2048 characters).")
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
-    if not urlparse(url).hostname:
+    parsed = urlparse(url)
+    if not parsed.hostname:
         raise ValueError("Could not parse a hostname from that URL.")
+    if parsed.hostname.startswith(".") or parsed.hostname.endswith("."):
+        raise ValueError("Invalid hostname in URL.")
     return url
 
 
@@ -861,12 +888,14 @@ def analyze_chain():
     try:
         url = parse_analyze_url()
     except ValueError as exc:
+        logger.warning(f"Invalid URL submitted: {exc}")
         return jsonify({"error": str(exc)}), 400
 
     now = time.time()
     cached_result = RESULT_CACHE.get(url)
     if cached_result and now - cached_result[0] < CACHE_TTL:
         cached = cached_result[1]
+        logger.info(f"Cache hit for {url}")
         return jsonify(
             {
                 "chain": cached.get("chain", []),
@@ -881,10 +910,13 @@ def analyze_chain():
 
     try:
         start = time.time()
+        logger.info(f"Starting chain analysis for {url}")
         chain, html = follow_chain(url)
         elapsed = round(time.time() - start, 2)
+        logger.info(f"Chain analysis completed for {url} in {elapsed}s ({len(chain)} hops)")
     except Exception as exc:
-        return jsonify({"error": f"Analysis failed: {exc}"}), 500
+        logger.error(f"Analysis failed for {url}: {exc}", exc_info=True)
+        return jsonify({"error": "Analysis failed. Please try again later."}), 500
 
     page_analysis = analyze_page_content(html) if html else {}
     deep = deep_analysis(chain, html, page_analysis)
@@ -943,30 +975,31 @@ def analyze():
     try:
         url = normalize_url(body.get("url") or "")
     except ValueError as exc:
+        logger.warning(f"Invalid URL submitted: {exc}")
         return jsonify({"error": str(exc)}), 400
 
     now = time.time()
     cached_result = RESULT_CACHE.get(url)
     if cached_result and now - cached_result[0] < CACHE_TTL:
+        logger.info(f"Cache hit for {url}")
         return jsonify({**cached_result[1], "cached": True, "cached_age": int(now - cached_result[0])})
 
     try:
         start = time.time()
+        logger.info(f"Starting full analysis for {url}")
         chain, html = follow_chain(url)
         elapsed = round(time.time() - start, 2)
+        logger.info(f"Chain analysis completed in {elapsed}s ({len(chain)} hops)")
     except Exception as exc:
-        return jsonify({"error": f"Analysis failed: {exc}"}), 500
+        logger.error(f"Analysis failed for {url}: {exc}", exc_info=True)
+        return jsonify({"error": "Analysis failed. Please try again later."}), 500
 
     external = bool_value(body.get("external_intel"), True)
     summary = chain_summary(chain)
     html_excerpt = html[:3000] if html else ""
 
-    # FIX 2 (cont.): Run VT, urlscan and Groq AI in parallel when external
-    # intel is requested.  The old /analyze route called them sequentially:
-    # vt_lookup (~1 s) + urlscan_lookup (up to 25 s) + ai_site (~2 s) = ~28 s.
-    # With parallelism the wall-clock time is the slowest of the three (~2 s
-    # now that urlscan_lookup no longer polls).
     if external:
+        logger.info(f"Starting external intel lookup for {url}")
         with ThreadPoolExecutor(max_workers=3) as pool:
             vt_f = pool.submit(vt_lookup, url)
             us_f = pool.submit(urlscan_lookup, url)
@@ -974,6 +1007,7 @@ def analyze():
             vt_result = vt_f.result()
             us_result = us_f.result()
             ai_result = ai_f.result()
+        logger.info(f"External intel completed: VT={vt_result.get('available')}, urlscan={us_result.get('available')}, AI={ai_result.get('available')}")
     else:
         vt_result = {"available": False}
         us_result = {"available": False}
@@ -1021,13 +1055,16 @@ def urlscan_screenshot_route(scan_id):
 @app.route("/analyze-file", methods=["POST"])
 def analyze_file():
     if "file" not in request.files:
+        logger.warning("File upload attempted with no file")
         return jsonify({"error": "No file uploaded"}), 400
     upload = request.files["file"]
     filename = secure_filename(upload.filename or "")
     if not filename:
+        logger.warning("File upload with invalid filename")
         return jsonify({"error": "No file selected"}), 400
     if not allowed_file(filename):
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "unknown"
+        logger.warning(f"Unsupported file type: {ext}")
         return jsonify({"error": f"File type '.{ext}' not supported. Supported: images, PDFs, Office docs, media files."}), 400
 
     tmp_path = None
@@ -1035,17 +1072,21 @@ def analyze_file():
         with tempfile.NamedTemporaryFile(suffix=f"_{filename}", delete=False) as tmp:
             upload.save(tmp.name)
             tmp_path = tmp.name
+        logger.info(f"Starting file analysis for {filename}")
         metadata = extract_metadata(tmp_path, filename)
-        metadata["ai_analysis"] = ai_file(filename, metadata) if bool_value(request.form.get("external_intel"), True) else {"available": False}
+        external = bool_value(request.form.get("external_intel"), True)
+        metadata["ai_analysis"] = ai_file(filename, metadata) if external else {"available": False}
+        logger.info(f"File analysis completed for {filename}")
         return jsonify(metadata)
     except Exception as exc:
-        return jsonify({"error": f"File analysis failed: {exc}"}), 500
+        logger.error(f"File analysis failed for {filename}: {exc}", exc_info=True)
+        return jsonify({"error": "File analysis failed. Please try again later."}), 500
     finally:
         if tmp_path:
             try:
                 os.unlink(tmp_path)
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warning(f"Failed to delete temp file {tmp_path}: {e}")
 
 
 if __name__ == "__main__":

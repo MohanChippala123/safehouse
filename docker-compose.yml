@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  safehouse:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+      - FLASK_DEBUG=1
+      - VT_API_KEY=${VT_API_KEY:-}
+      - URLSCAN_KEY=${URLSCAN_KEY:-}
+      - GROQ_KEY=${GROQ_KEY:-}
+      - CACHE_TTL=300
+      - MAX_HOPS=10
+    volumes:
+      - .:/app
+      - /app/__pycache__
+    command: flask run --host=0.0.0.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
