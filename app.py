@@ -52,6 +52,20 @@ except ImportError:
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
+
+@app.after_request
+def add_cache_headers(response: Any) -> Any:
+    """Add cache control headers to responses."""
+    if response.status_code == 200:
+        if request.path.startswith("/analyze"):
+            response.headers["Cache-Control"] = f"public, max-age={CACHE_TTL}"
+        elif request.path.startswith("/static"):
+            response.headers["Cache-Control"] = "public, max-age=3600"
+        else:
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
 VT_API_KEY = os.environ.get("VT_API_KEY", "")
 URLSCAN_KEY = os.environ.get("URLSCAN_KEY", "")
 GROQ_KEY = os.environ.get("GROQ_KEY", "")
@@ -1132,18 +1146,23 @@ def urlscan_screenshot_route(scan_id: str) -> tuple[Any, int]:
 @app.route("/analyze-file", methods=["POST"])
 def analyze_file() -> tuple[Any, int]:
     """Analyze file for metadata and privacy risks."""
+    content_length = request.content_length
+    if content_length and content_length > app.config["MAX_CONTENT_LENGTH"]:
+        logger.warning(f"File upload exceeded max size: {content_length}")
+        return _error_response("File size exceeds 50MB limit", 413)
+
     if "file" not in request.files:
         logger.warning("File upload attempted with no file")
-        return jsonify({"error": "No file uploaded"}), 400
+        return _error_response("No file uploaded")
     upload = request.files["file"]
     filename = secure_filename(upload.filename or "")
     if not filename:
         logger.warning("File upload with invalid filename")
-        return jsonify({"error": "No file selected"}), 400
+        return _error_response("No file selected")
     if not allowed_file(filename):
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "unknown"
         logger.warning(f"Unsupported file type: {ext}")
-        return jsonify({"error": f"File type '.{ext}' not supported. Supported: images, PDFs, Office docs, media files."}), 400
+        return _error_response(f"File type '.{ext}' not supported. Supported: images, PDFs, Office docs, media files.")
 
     tmp_path = None
     try:
@@ -1155,10 +1174,10 @@ def analyze_file() -> tuple[Any, int]:
         external = bool_value(request.form.get("external_intel"), True)
         metadata["ai_analysis"] = ai_file(filename, metadata) if external else {"available": False}
         logger.info(f"File analysis completed for {filename}")
-        return jsonify(metadata)
+        return jsonify(metadata), 200
     except Exception as exc:
         logger.error(f"File analysis failed for {filename}: {exc}", exc_info=True)
-        return jsonify({"error": "File analysis failed. Please try again later."}), 500
+        return _error_response("File analysis failed. Please try again later.", 500)
     finally:
         if tmp_path:
             try:
