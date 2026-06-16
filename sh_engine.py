@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import re
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 try:
@@ -30,17 +31,20 @@ _PNG_TEXT_MAP = {
 }
 
 
-def _coerce(value):
+def _coerce(value: Any) -> str:
+    """Coerce value to string, handling bytes and encoding edge cases."""
     if isinstance(value, bytes):
         try:
-            return value.decode("utf-16-le").strip("\x00") if value[1:2] == b"\x00" else value.decode("utf-8", "ignore").strip("\x00")
+            decoded = value.decode("utf-16-le").strip("\x00") if value[1:2] == b"\x00" else value.decode("utf-8", "ignore").strip("\x00")
+            return decoded[:300]
         except Exception:
             return value.hex()[:64]
     s = str(value).strip("\x00 ").strip()
     return s[:300]
 
 
-def _gps_to_decimal(coord, ref):
+def _gps_to_decimal(coord: Any, ref: Any) -> float | None:
+    """Convert GPS coordinates to decimal format."""
     try:
         d, m, s = (float(x) for x in coord)
         dec = d + m / 60.0 + s / 3600.0
@@ -51,7 +55,7 @@ def _gps_to_decimal(coord, ref):
         return None
 
 
-def extract_image_metadata(filepath: str, ext: str) -> dict:
+def extract_image_metadata(filepath: str, ext: str) -> dict[str, Any]:
     if Image is None:
         return {}
     flat = {}
@@ -144,11 +148,13 @@ PWD_TYPE = "pass" + "word"
 
 
 def _apex(host: str) -> str:
+    """Extract apex domain from hostname."""
     parts = (host or "").lower().strip(".").split(".")
     return ".".join(parts[-2:]) if len(parts) >= 2 else host or ""
 
 
 def _lev(a: str, b: str) -> int:
+    """Calculate Levenshtein distance between strings."""
     if a == b:
         return 0
     if not a:
@@ -165,13 +171,15 @@ def _lev(a: str, b: str) -> int:
 
 
 def _skeleton(s: str) -> str:
+    """Normalize string by replacing homoglyphs with ASCII equivalents."""
     out = s.lower()
     for bad, good in HOMOGLYPHS.items():
         out = out.replace(bad, good)
     return out
 
 
-def trace_credentials(html: str, page_url: str) -> dict:
+def trace_credentials(html: str, page_url: str) -> dict[str, Any]:
+    """Detect forms that might harvest credentials."""
     if not html:
         return {"available": False, "forms": [], "risk": 0, "flags": []}
     page_host = urlparse(page_url).hostname or ""
@@ -228,7 +236,8 @@ def trace_credentials(html: str, page_url: str) -> dict:
     }
 
 
-def detect_typosquat(host: str) -> dict:
+def detect_typosquat(host: str) -> dict[str, Any]:
+    """Detect typosquatting and homoglyph attacks."""
     host = (host or "").lower().strip(".")
     apex = _apex(host)
     label = apex.split(".")[0] if apex else ""
@@ -261,7 +270,8 @@ def detect_typosquat(host: str) -> dict:
     return {"available": True, "matches": findings, "risk": min(risk, 100), "flags": flags, "is_brand": False}
 
 
-def deobfuscate(html: str) -> dict:
+def deobfuscate(html: str) -> dict[str, Any]:
+    """Detect and decode obfuscated JavaScript code."""
     if not html:
         return {"available": False, "layers": []}
     layers, sample = [], html[:60000]
@@ -297,7 +307,8 @@ def deobfuscate(html: str) -> dict:
     return {"available": bool(uniq), "layers": uniq[:8], "suspicious": suspicious}
 
 
-def assemble_graph(chain, deep) -> dict:
+def assemble_graph(chain: list[dict[str, Any]] | None, deep: dict[str, Any] | None) -> dict[str, Any]:
+    """Build graph representation of threat chain and connections."""
     nodes, edges = {}, []
     chain = chain or []
     deep = deep or {}
@@ -354,7 +365,8 @@ def assemble_graph(chain, deep) -> dict:
     return {"nodes": list(nodes.values()), "edges": edges, "available": len(nodes) > 1}
 
 
-def build_timeline(chain, page_analysis, deep) -> dict:
+def build_timeline(chain: list[dict[str, Any]] | None, page_analysis: dict[str, Any] | None, deep: dict[str, Any] | None) -> dict[str, Any]:
+    """Build timeline of threat events."""
     chain = chain or []
     events = []
     for i, hop in enumerate(chain):
@@ -394,10 +406,12 @@ def build_timeline(chain, page_analysis, deep) -> dict:
 
 
 def risk_band(score: int) -> str:
+    """Convert risk score to risk band."""
     return "clean" if score == 0 else "low" if score < 25 else "medium" if score < 55 else "high"
 
 
-def _verdict_label(score: int, evidence: list[dict]) -> tuple[str, str]:
+def _verdict_label(score: int, evidence: list[dict[str, Any]]) -> tuple[str, str]:
+    """Generate verdict label and explanation based on score and evidence."""
     high = [e for e in evidence if e["severity"] == "high"]
     if score >= 70 or len(high) >= 2:
         return "DANGEROUS", high[0]["detail"] if high else "Multiple high-severity threats detected."
@@ -410,7 +424,8 @@ def _verdict_label(score: int, evidence: list[dict]) -> tuple[str, str]:
     return "CLEAN", "No threat signals detected."
 
 
-def build_verdict(chain, page_analysis, cred, typo, deob, vt=None) -> dict:
+def build_verdict(chain: list[dict[str, Any]] | None, page_analysis: dict[str, Any] | None, cred: dict[str, Any] | None, typo: dict[str, Any] | None, deob: dict[str, Any] | None, vt: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build security verdict from all analysis data."""
     evidence, score = [], 0
 
     def add(name, detail, weight, severity):
