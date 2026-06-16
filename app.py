@@ -154,38 +154,21 @@ _MAX_APEX_CACHE = 1000
 _SESSION = requests.Session()
 
 
-def _evict_lookup_cache() -> None:
-    """Drop stale or oldest entries from LOOKUP_CACHE when it exceeds the cap."""
-    now = time.time()
-    stale = [k for k, (ts, _) in LOOKUP_CACHE.items() if now - ts >= CACHE_TTL]
-    for k in stale:
-        LOOKUP_CACHE.pop(k, None)
-    if len(LOOKUP_CACHE) >= _MAX_LOOKUP_CACHE:
-        oldest = min(LOOKUP_CACHE.items(), key=lambda x: x[1][0])
-        LOOKUP_CACHE.pop(oldest[0], None)
-
-
-def _evict_result_cache() -> None:
-    """Drop expired entries, then oldest entry if still over cap."""
-    now = time.time()
-    expired = [k for k, (ts, _) in RESULT_CACHE.items() if now - ts >= CACHE_TTL]
-    for k in expired:
-        RESULT_CACHE.pop(k, None)
-    if len(RESULT_CACHE) >= _MAX_RESULT_CACHE:
-        oldest = min(RESULT_CACHE.items(), key=lambda x: x[1][0])
-        RESULT_CACHE.pop(oldest[0], None)
-
-
-def _evict_apex_cache() -> None:
-    """Drop oldest entries from _APEX_CACHE when it exceeds the cap."""
-    if len(_APEX_CACHE) >= _MAX_APEX_CACHE:
-        oldest = min(_APEX_CACHE.items(), key=lambda x: x[0])
-        _APEX_CACHE.pop(oldest[0], None)
+def _evict_cache(cache: dict, max_size: int, ttl_check: bool = True) -> None:
+    """Generic cache eviction: expire old entries, then remove oldest if over cap."""
+    if ttl_check:
+        now = time.time()
+        stale = [k for k, (ts, _) in cache.items() if now - ts >= CACHE_TTL]
+        for k in stale:
+            cache.pop(k, None)
+    if len(cache) >= max_size and cache:
+        oldest = min(cache.items(), key=lambda x: x[1][0] if isinstance(x[1], tuple) else id(x))
+        cache.pop(oldest[0], None)
 
 
 def cached(key: str, fn):
     if key not in LOOKUP_CACHE:
-        _evict_lookup_cache()
+        _evict_cache(LOOKUP_CACHE, _MAX_LOOKUP_CACHE)
         LOOKUP_CACHE[key] = (time.time(), fn())
     return LOOKUP_CACHE[key][1]
 
@@ -199,7 +182,7 @@ def _get_apex(hostname: str) -> str:
     """Extract apex domain (e.g., example.com from sub.example.com) with caching."""
     if hostname in _APEX_CACHE:
         return _APEX_CACHE[hostname]
-    _evict_apex_cache()
+    _evict_cache(_APEX_CACHE, _MAX_APEX_CACHE, ttl_check=False)
     host = hostname.lower().strip(".")
     parts = host.split(".")
     apex = ".".join(parts[-2:]) if len(parts) >= 2 else host
@@ -325,74 +308,73 @@ def score_hop(hop: dict) -> dict:
     headers = hop.get("headers") or {}
     trusted = domain_in(host, TRUSTED_DOMAINS)
 
-    def add(label: str, points=0):
+    def add(label: str, pts=0):
         nonlocal score
         flags.append(label)
-        score += points
+        score += pts
 
-    if domain_in(host, SHORTENERS):
-        add("url shortener", 15)
-    if any(ord(ch) > 127 for ch in host):
-        add("non-ASCII characters in domain", 40)
-    if any(part.startswith("xn--") for part in host.split(".")):
-        add("punycode IDN domain (possible spoofing)", 20)
-    if not trusted and any(host.endswith(tld) for tld in SUSPICIOUS_TLDS):
-        add(f"high-abuse TLD ({next(tld for tld in SUSPICIOUS_TLDS if host.endswith(tld))})", 15)
+    checks = [
+        (domain_in(host, SHORTENERS), "url shortener", 15),
+        (any(ord(ch) > 127 for ch in host), "non-ASCII characters in domain", 40),
+        (any(p.startswith("xn--") for p in host.split(".")), "punycode IDN domain (possible spoofing)", 20),
+        (not trusted and any(host.endswith(t) for t in SUSPICIOUS_TLDS), f"high-abuse TLD ({next((t for t in SUSPICIOUS_TLDS if host.endswith(t)), '')})", 15),
+        (not trusted and len(host.rstrip(".").split(".")) > 4, f"deep subdomain ({len(host.rstrip('.').split('.'))} labels)", 10),
+    ]
+    for cond, label, pts in checks:
+        if cond:
+            add(label, pts)
+
     try:
         ipaddress.ip_address(host)
         add("URL points directly to IP address", 25)
     except ValueError:
         pass
-    if not trusted and len(host.rstrip(".").split(".")) > 4:
-        add(f"deep subdomain ({len(host.rstrip('.').split('.'))} labels)", 10)
 
     tls = hop.get("tls") or {}
     if hop.get("scheme") == "https":
         if not tls.get("valid"):
             add("invalid / self-signed certificate", 30)
-        elif not trusted:
-            issuer = (tls.get("issuer") or "").lower()
-            if 0 <= tls.get("age_days", 999) < 30 and not any(ca in issuer for ca in TRUSTED_CAS):
-                add(f"cert only {tls['age_days']}d old (unknown CA)", 25)
-            if 0 <= tls.get("expires_in_days", 999) < 7:
-                add(f"cert expires in {tls['expires_in_days']}d", 10)
+        elif not trusted and tls.get("age_days", 999) < 30 and not any(ca in (tls.get("issuer") or "").lower() for ca in TRUSTED_CAS):
+            add(f"cert only {tls['age_days']}d old (unknown CA)", 25)
+        if 0 <= tls.get("expires_in_days", 999) < 7:
+            add(f"cert expires in {tls['expires_in_days']}d", 10)
     else:
         add("plain HTTP, no encryption", 20)
 
     if not trusted:
         age = (hop.get("domain_age") or {}).get("age_days", -1)
-        registrar = (hop.get("domain_age") or {}).get("registrar", "")
+        reg = (hop.get("domain_age") or {}).get("registrar", "")
         if 0 <= age < 30:
             add(f"domain only {age}d old", 40)
         elif 0 <= age < 90:
             add(f"domain {age}d old", 20)
-        if any(name in registrar for name in SUSPICIOUS_REGISTRARS):
-            add(f"registrar: {registrar[:30]}", 20)
+        if any(n in reg for n in SUSPICIOUS_REGISTRARS):
+            add(f"registrar: {reg[:30]}", 20)
         if (hop.get("asn") or {}).get("asn") in SUSPICIOUS_ASNS:
             add(f"suspicious hosting ASN ({hop['asn']['asn']})", 25)
-        if headers.get("server") and not any(name in headers["server"].lower() for name in ("nginx", "apache", "cloudflare", "iis", "litespeed", "openresty", "caddy", "gunicorn", "vercel", "netlify", "fastly", "akamai", "envoy", "traefik")):
+        srv = headers.get("server", "").lower()
+        if srv and not any(n in srv for n in ("nginx", "apache", "cloudflare", "iis", "litespeed", "openresty", "caddy", "gunicorn", "vercel", "netlify", "fastly", "akamai", "envoy", "traefik")):
             add(f"unusual server: {headers['server'][:30]}", 10)
-        missing = [name for name, key in (("CSP", "content-security-policy"), ("HSTS", "strict-transport-security")) if not headers.get(key)]
+        missing = [n for n, k in [("CSP", "content-security-policy"), ("HSTS", "strict-transport-security")] if not headers.get(k)]
         if not headers.get("x-frame-options") and not headers.get("content-security-policy"):
             missing.append("X-Frame-Options")
         if missing:
             add(f"missing headers: {', '.join(missing)}", 5)
         if headers.get("x-powered-by"):
             add(f"X-Powered-By: {headers['x-powered-by'][:30]}")
-        cookie = headers.get("set-cookie", "").lower()
-        issues = [label for token, label in (("secure", "no Secure flag"), ("httponly", "no HttpOnly flag"), ("samesite", "no SameSite flag")) if cookie and token not in cookie]
+        cook = headers.get("set-cookie", "").lower()
+        issues = [l for t, l in [("secure", "no Secure flag"), ("httponly", "no HttpOnly flag"), ("samesite", "no SameSite flag")] if cook and t not in cook]
         if issues:
             add(f"cookie: {', '.join(issues)}", 5)
 
-    content_type = headers.get("content-type", "")
-    if hop.get("status_code") == 200 and content_type and not trusted:
-        if "application/octet-stream" in content_type or "application/x-msdownload" in content_type:
+    ct = headers.get("content-type", "")
+    if hop.get("status_code") == 200 and ct and not trusted:
+        if "application/octet-stream" in ct or "application/x-msdownload" in ct:
             add("response is a file download", 30)
-        elif "application/zip" in content_type or "application/x-zip" in content_type:
+        elif "application/zip" in ct or "application/x-zip" in ct:
             add("response is a ZIP archive", 25)
 
-    score = min(score, 100)
-    hop.update({"flags": flags, "risk_score": score, "risk_level": risk_level(score), "trusted": trusted})
+    hop.update({"flags": flags, "risk_score": min(score, 100), "risk_level": risk_level(score), "trusted": trusted})
     return hop
 
 
@@ -433,26 +415,14 @@ def extract_ooxml_metadata(filepath: str) -> dict:
     flat = {}
     try:
         with zipfile.ZipFile(filepath) as archive:
-            if "docProps/core.xml" in archive.namelist():
-                root = ET.fromstring(archive.read("docProps/core.xml"))
-                for key, tag in (
-                    ("Creator", "dc:creator"),
-                    ("LastModifiedBy", "cp:lastModifiedBy"),
-                    ("CreateDate", "dcterms:created"),
-                    ("ModifyDate", "dcterms:modified"),
-                    ("Title", "dc:title"),
-                    ("Subject", "dc:subject"),
-                ):
-                    value = _ooxml_text(root, tag)
-                    if value and key not in flat:
-                        flat[key] = value
-            if "docProps/app.xml" in archive.namelist():
-                root = ET.fromstring(archive.read("docProps/app.xml"))
-                for key, tag in (
-                    ("Software", "ep:Application"),
-                    ("Company", "ep:Company"),
-                    ("Manager", "ep:Manager"),
-                ):
+            for xml_file, mappings in [
+                ("docProps/core.xml", [("Creator", "dc:creator"), ("LastModifiedBy", "cp:lastModifiedBy"), ("CreateDate", "dcterms:created"), ("ModifyDate", "dcterms:modified"), ("Title", "dc:title"), ("Subject", "dc:subject")]),
+                ("docProps/app.xml", [("Software", "ep:Application"), ("Company", "ep:Company"), ("Manager", "ep:Manager")]),
+            ]:
+                if xml_file not in archive.namelist():
+                    continue
+                root = ET.fromstring(archive.read(xml_file))
+                for key, tag in mappings:
                     value = _ooxml_text(root, tag)
                     if value:
                         flat[key] = value
@@ -465,19 +435,10 @@ def extract_pdf_metadata(filepath: str) -> dict:
     flat = {}
     try:
         text = Path(filepath).read_bytes()[:500000].decode("latin-1", errors="ignore")
-        for src, dst in (
-            ("Author", "Author"),
-            ("Creator", "Creator"),
-            ("Producer", "Producer"),
-            ("Title", "Title"),
-            ("Subject", "Subject"),
-            ("CreationDate", "CreateDate"),
-            ("ModDate", "ModifyDate"),
-            ("Company", "Company"),
-        ):
-            match = re.search(rf"/{src}\s*\(([^)]*)\)", text)
-            if match and match.group(1).strip():
-                flat[dst] = match.group(1).strip()
+        for src, dst in [("Author", "Author"), ("Creator", "Creator"), ("Producer", "Producer"), ("Title", "Title"), ("Subject", "Subject"), ("CreationDate", "CreateDate"), ("ModDate", "ModifyDate"), ("Company", "Company")]:
+            m = re.search(rf"/{src}\s*\(([^)]*)\)", text)
+            if m and m.group(1).strip():
+                flat[dst] = m.group(1).strip()
     except Exception:
         return {}
     return flat
@@ -613,18 +574,6 @@ def vt_lookup(url: str) -> dict[str, Any]:
         return {"available": False, "error": "API error"}
 
 
-def urlscan_with_proxy(scan_id: str, **extra) -> dict:
-    return {
-        "available": True,
-        "uuid": scan_id,
-        "report_url": f"https://urlscan.io/result/{scan_id}/",
-        "screenshot_url": f"https://urlscan.io/screenshots/{scan_id}.png",
-        "screenshot_proxy": f"/urlscan-screenshot/{scan_id}",
-        "ready": False,
-        **extra,
-    }
-
-
 def urlscan_screenshot_ready(scan_id: str, shot_url: str | None = None) -> bool:
     """Check if URLscan screenshot is ready."""
     headers = {"API-Key": URLSCAN_KEY}
@@ -711,7 +660,14 @@ def urlscan_submit(url: str) -> dict:
         scan_id = res.json().get("uuid")
         if not scan_id:
             return {"available": False, "error": "No scan uuid returned"}
-        return urlscan_with_proxy(scan_id)
+        return {
+            "available": True,
+            "uuid": scan_id,
+            "report_url": f"https://urlscan.io/result/{scan_id}/",
+            "screenshot_url": f"https://urlscan.io/screenshots/{scan_id}.png",
+            "screenshot_proxy": f"/urlscan-screenshot/{scan_id}",
+            "ready": False,
+        }
     except Exception as exc:
         return {"available": False, "error": str(exc)}
 
@@ -735,7 +691,14 @@ def urlscan_lookup(url: str) -> dict:
 
 
 def urlscan_result(scan_id: str) -> dict:
-    base = urlscan_with_proxy(scan_id)
+    base = {
+        "available": True,
+        "uuid": scan_id,
+        "report_url": f"https://urlscan.io/result/{scan_id}/",
+        "screenshot_url": f"https://urlscan.io/screenshots/{scan_id}.png",
+        "screenshot_proxy": f"/urlscan-screenshot/{scan_id}",
+        "ready": False,
+    }
     if not URLSCAN_KEY:
         return {**base, "available": False, "error": "No urlscan API key"}
     try:
@@ -1114,7 +1077,7 @@ def analyze() -> tuple[Any, int]:
         "elapsed": elapsed,
         "cached": False,
     }
-    _evict_result_cache()
+    _evict_cache(RESULT_CACHE, _MAX_RESULT_CACHE)
     RESULT_CACHE[url] = (now, result)
     return jsonify(result)
 
