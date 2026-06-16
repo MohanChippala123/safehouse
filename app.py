@@ -54,8 +54,8 @@ app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
 
 @app.after_request
-def add_cache_headers(response: Any) -> Any:
-    """Add cache control headers to responses."""
+def add_security_headers(response: Any) -> Any:
+    """Add security and cache control headers."""
     if response.status_code == 200:
         if request.path.startswith("/analyze"):
             response.headers["Cache-Control"] = f"public, max-age={CACHE_TTL}"
@@ -63,8 +63,27 @@ def add_cache_headers(response: Any) -> Any:
             response.headers["Cache-Control"] = "public, max-age=3600"
         else:
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    # Security headers
     response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    if request.path.startswith("/static"):
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
+
+
+@app.before_request
+def validate_request():
+    """Validate requests for security."""
+    if request.method == "POST":
+        if request.content_length and request.content_length > app.config["MAX_CONTENT_LENGTH"]:
+            return _error_response("Payload too large", 413)
+        ct = request.content_type or ""
+        if "application/json" in ct:
+            if not request.data:
+                return _error_response("Empty request body", 400)
 
 VT_API_KEY = os.environ.get("VT_API_KEY", "")
 URLSCAN_KEY = os.environ.get("URLSCAN_KEY", "")
@@ -1149,5 +1168,73 @@ def analyze_file() -> tuple[Any, int]:
                 logger.warning(f"Failed to delete temp file {tmp_path}: {e}")
 
 
+@app.route("/api/batch", methods=["POST"])
+def batch_analyze() -> tuple[Any, int]:
+    """Analyze multiple URLs in batch."""
+    body = _parse_request_body()
+    urls = body.get("urls", [])
+    if not isinstance(urls, list) or not urls:
+        return _error_response("URLs must be a non-empty list")
+    if len(urls) > 100:
+        return _error_response("Maximum 100 URLs per batch", 413)
+
+    from concurrent.futures import ThreadPoolExecutor
+    results = []
+
+    def analyze_url(url: str) -> dict:
+        try:
+            normalized = normalize_url(url)
+            chain, html = follow_chain(normalized)
+            return {"url": url, "status": "success", "risk": max((h.get("risk_score", 0) for h in chain), default=0)}
+        except Exception as e:
+            return {"url": url, "status": "error", "error": str(e)}
+
+    with ThreadPoolExecutor(max_workers=min(5, len(urls))) as executor:
+        results = list(executor.map(analyze_url, urls))
+
+    return jsonify({"results": results, "count": len(results)}), 200
+
+
+@app.route("/api/export/<format>", methods=["GET"])
+def export_results(format: str) -> tuple[Any, int]:
+    """Export recent results."""
+    from db import AnalysisDB
+    from app_advanced import ResultExporter
+
+    if format not in ("json", "csv", "html"):
+        return _error_response("Format must be json, csv, or html")
+
+    stats = AnalysisDB.get_statistics()
+    high_risk = AnalysisDB.get_high_risk(50)
+
+    exporter = ResultExporter([{"url": r["url"], "data": r} for r in high_risk])
+
+    if format == "json":
+        return jsonify(json.loads(exporter.to_json())), 200
+    elif format == "csv":
+        return exporter.to_csv(), 200, {"Content-Type": "text/csv"}
+    else:  # html
+        return exporter.to_html_report(), 200, {"Content-Type": "text/html"}
+
+
+@app.route("/api/stats", methods=["GET"])
+def get_stats() -> tuple[Any, int]:
+    """Get analysis statistics."""
+    from db import AnalysisDB
+    return jsonify(AnalysisDB.get_statistics()), 200
+
+
+@app.route("/api/history", methods=["GET"])
+def get_history() -> tuple[Any, int]:
+    """Get analysis history."""
+    from db import AnalysisDB
+    limit = request.args.get("limit", 20, type=int)
+    if limit > 100:
+        limit = 100
+    return jsonify({"high_risk": AnalysisDB.get_high_risk(limit)}), 200
+
+
 if __name__ == "__main__":
+    from db import init_db
+    init_db()
     app.run(debug=os.environ.get("FLASK_DEBUG") == "1", port=5000, use_reloader=False)
