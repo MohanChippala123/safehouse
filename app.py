@@ -17,11 +17,13 @@ import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree as ET
 
 import requests
 import urllib3
+from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template, request
 from werkzeug.utils import secure_filename
 
@@ -35,6 +37,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+load_dotenv(Path(__file__).with_name(".env"), verbose=False)
+
 try:
     import whois as whois_lib
 except ImportError:
@@ -44,20 +48,6 @@ try:
     from ipwhois import IPWhois
 except ImportError:
     IPWhois = None
-
-
-def load_env(path: Path) -> None:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return
-    for line in lines:
-        if line.strip() and not line.lstrip().startswith("#") and "=" in line:
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip().strip("'\"").strip())
-
-
-load_env(Path(__file__).with_name(".env"))
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
@@ -146,6 +136,8 @@ OOXML_NS = {
 _ALL_SENSITIVE_FIELDS: set[str] = {f for fields in SENSITIVE_FIELDS.values() for f in fields}
 
 _APEX_CACHE: dict[str, str] = {}
+_MAX_APEX_CACHE = 1000
+_SESSION = requests.Session()
 
 
 def _evict_lookup_cache() -> None:
@@ -170,6 +162,13 @@ def _evict_result_cache() -> None:
         RESULT_CACHE.pop(oldest[0], None)
 
 
+def _evict_apex_cache() -> None:
+    """Drop oldest entries from _APEX_CACHE when it exceeds the cap."""
+    if len(_APEX_CACHE) >= _MAX_APEX_CACHE:
+        oldest = min(_APEX_CACHE.items(), key=lambda x: x[0])
+        _APEX_CACHE.pop(oldest[0], None)
+
+
 def cached(key: str, fn):
     if key not in LOOKUP_CACHE:
         _evict_lookup_cache()
@@ -177,7 +176,8 @@ def cached(key: str, fn):
     return LOOKUP_CACHE[key][1]
 
 
-def bool_value(value, default=True) -> bool:
+def bool_value(value: Any, default: bool = True) -> bool:
+    """Convert value to boolean."""
     return default if value is None else str(value).lower() not in {"0", "false", "off", "no"}
 
 
@@ -185,6 +185,7 @@ def _get_apex(hostname: str) -> str:
     """Extract apex domain (e.g., example.com from sub.example.com) with caching."""
     if hostname in _APEX_CACHE:
         return _APEX_CACHE[hostname]
+    _evict_apex_cache()
     host = hostname.lower().strip(".")
     parts = host.split(".")
     apex = ".".join(parts[-2:]) if len(parts) >= 2 else host
@@ -193,19 +194,23 @@ def _get_apex(hostname: str) -> str:
 
 
 def domain_in(hostname: str, domains: set[str]) -> bool:
+    """Check if hostname belongs to trusted domains."""
     host = hostname.lower().strip(".")
     return any(host == domain or host.endswith("." + domain) for domain in domains)
 
 
 def risk_level(score: int) -> str:
+    """Convert risk score to risk level."""
     return "clean" if score == 0 else "low" if score < 25 else "medium" if score < 55 else "high"
 
 
 def allowed_file(filename: str) -> bool:
+    """Check if file extension is in allowed list."""
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
 def safe_ip(hostname: str) -> str:
+    """Resolve hostname to IP address."""
     try:
         return socket.gethostbyname(hostname)
     except socket.gaierror:
@@ -562,18 +567,36 @@ def extract_metadata(filepath: str, filename: str) -> dict:
     return metadata_from_raw(raw, filepath, filename)
 
 
-def vt_lookup(url: str) -> dict:
+def vt_lookup(url: str) -> dict[str, Any]:
+    """Look up URL in VirusTotal."""
     if not VT_API_KEY:
         return {"available": False}
     try:
         url_id = base64.urlsafe_b64encode(url.encode()).rstrip(b"=").decode()
-        res = requests.get(f"https://www.virustotal.com/api/v3/urls/{url_id}", headers={"x-apikey": VT_API_KEY}, timeout=10)
+        res = requests.get(
+            f"https://www.virustotal.com/api/v3/urls/{url_id}",
+            headers={"x-apikey": VT_API_KEY},
+            timeout=10
+        )
+        if res.status_code == 404:
+            return {"available": True, "malicious": 0, "suspicious": 0, "harmless": 0, "undetected": 0}
         if res.status_code != 200:
+            logger.warning(f"VirusTotal returned {res.status_code}")
             return {"available": False, "error": f"HTTP {res.status_code}"}
         stats = res.json()["data"]["attributes"]["last_analysis_stats"]
-        return {"available": True, **{key: stats.get(key, 0) for key in ("malicious", "suspicious", "harmless", "undetected")}}
+        return {
+            "available": True,
+            "malicious": stats.get("malicious", 0),
+            "suspicious": stats.get("suspicious", 0),
+            "harmless": stats.get("harmless", 0),
+            "undetected": stats.get("undetected", 0)
+        }
+    except requests.Timeout:
+        logger.warning("VirusTotal timeout")
+        return {"available": False, "error": "Timeout"}
     except Exception as exc:
-        return {"available": False, "error": str(exc)}
+        logger.error(f"VirusTotal error: {exc}")
+        return {"available": False, "error": "API error"}
 
 
 def urlscan_with_proxy(scan_id: str, **extra) -> dict:
@@ -589,11 +612,14 @@ def urlscan_with_proxy(scan_id: str, **extra) -> dict:
 
 
 def urlscan_screenshot_ready(scan_id: str, shot_url: str | None = None) -> bool:
+    """Check if URLscan screenshot is ready."""
     headers = {"API-Key": URLSCAN_KEY}
     shot_url = shot_url or f"https://urlscan.io/screenshots/{scan_id}.png"
     try:
         probe = requests.head(shot_url, headers=headers, timeout=10, allow_redirects=True)
         return probe.status_code == 200
+    except requests.Timeout:
+        return False
     except Exception:
         return False
 
@@ -602,6 +628,7 @@ def urlscan_fetch_png(scan_id: str) -> tuple[bytes | None, str]:
     """Return PNG bytes and the URL that worked, or (None, '')."""
     headers = {"API-Key": URLSCAN_KEY}
     candidates: list[str] = []
+
     try:
         result = requests.get(
             f"https://urlscan.io/api/v1/result/{scan_id}/",
@@ -614,23 +641,28 @@ def urlscan_fetch_png(scan_id: str) -> tuple[bytes | None, str]:
                 url = task.get(key)
                 if url:
                     candidates.append(url)
-    except Exception:
-        pass
+    except (requests.Timeout, requests.RequestException):
+        logger.debug("Failed to fetch URLscan result metadata")
+
     candidates.append(f"https://urlscan.io/screenshots/{scan_id}.png")
     seen: set[str] = set()
+
     for url in candidates:
         if url in seen:
             continue
         seen.add(url)
         try:
             res = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
-        except Exception:
-            continue
-        if res.status_code != 200 or not res.content:
-            continue
-        content_type = (res.headers.get("Content-Type") or "").lower()
-        if content_type.startswith("image/") or res.content[:8].startswith(b"\x89PNG\r\n\x1a\n"):
-            return res.content, url
+            if res.status_code != 200 or not res.content:
+                continue
+            content_type = (res.headers.get("Content-Type") or "").lower()
+            if content_type.startswith("image/") or res.content[:8].startswith(b"\x89PNG\r\n\x1a\n"):
+                return res.content, url
+        except requests.Timeout:
+            logger.debug(f"Timeout fetching screenshot from {url}")
+        except requests.RequestException as e:
+            logger.debug(f"Error fetching screenshot: {e}")
+
     return None, ""
 
 
@@ -707,19 +739,43 @@ def urlscan_result(scan_id: str) -> dict:
         return {**base, "error": str(exc)}
 
 
-def groq_json(prompt: str, max_tokens: int) -> dict:
+def groq_json(prompt: str, max_tokens: int) -> dict[str, Any]:
+    """Call Groq API and extract JSON response."""
     if not GROQ_KEY:
         return {"available": False}
     try:
-        res = requests.post(GROQ_URL, headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"}, json={"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0.2}, timeout=25)
+        res = requests.post(
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": GROQ_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.2
+            },
+            timeout=30
+        )
         if res.status_code != 200:
-            return {"available": False, "error": f"Groq HTTP {res.status_code}"}
+            logger.warning(f"Groq API returned {res.status_code}")
+            return {"available": False, "error": f"HTTP {res.status_code}"}
         text = res.json()["choices"][0]["message"]["content"].strip()
         text = _RE_JSON_FENCE.sub("", text)
         start, end = text.find("{"), text.rfind("}")
-        return {"available": True, **json.loads(text[start : end + 1] if start != -1 and end != -1 else text)}
+        if start == -1 or end == -1:
+            return {"available": False, "error": "No JSON found in response"}
+        return {"available": True, **json.loads(text[start:end + 1])}
+    except requests.Timeout:
+        logger.warning("Groq API timeout")
+        return {"available": False, "error": "Request timeout"}
+    except json.JSONDecodeError as e:
+        logger.warning(f"Groq JSON decode error: {e}")
+        return {"available": False, "error": "Invalid JSON response"}
     except Exception as exc:
-        return {"available": False, "error": str(exc)}
+        logger.error(f"Groq API error: {exc}")
+        return {"available": False, "error": "API error"}
 
 
 def ai_site(url: str, summary: str, html: str) -> dict:
@@ -750,32 +806,47 @@ Return only JSON with "summary", "privacy_risks", "journalist_advice", "threat_l
 
 
 def normalize_url(url: str) -> str:
+    """Normalize and validate URL.
+
+    Args:
+        url: URL to normalize
+
+    Returns:
+        Normalized URL with https:// prefix
+
+    Raises:
+        ValueError: If URL is invalid
+    """
     url = url.strip()
     if not url:
         raise ValueError("No URL provided.")
     if len(url) > 2048:
         raise ValueError("URL exceeds maximum length (2048 characters).")
+    if "\n" in url or "\r" in url or "\x00" in url:
+        raise ValueError("URL contains invalid characters.")
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     parsed = urlparse(url)
     if not parsed.hostname:
         raise ValueError("Could not parse a hostname from that URL.")
-    if parsed.hostname.startswith(".") or parsed.hostname.endswith("."):
+    hostname = parsed.hostname.lower().strip(".")
+    if not hostname or hostname.startswith(".") or hostname.endswith("."):
         raise ValueError("Invalid hostname in URL.")
+    if hostname.count(".") > 20:
+        raise ValueError("Hostname has too many labels (max 20).")
     return url
 
 
-def follow_chain(url: str) -> tuple[list[dict], str]:
-    # FIX 5: Removed LOOKUP_CACHE.clear() which was called at the start of
-    # every follow_chain invocation, defeating cross-request caching of TLS,
-    # ASN and WHOIS results.  Those lookups are keyed by host/IP so they are
-    # safe to retain across requests.  The bounded eviction functions handle
-    # memory pressure instead.
-    #
-    # FIX 1 (cont.): Per-hop TLS + domain-age + ASN lookups are now dispatched
-    # in parallel via _fetch_hop_enrichments, then score_hop is called with the
-    # pre-fetched results.
-    session = requests.Session()
+def follow_chain(url: str) -> tuple[list[dict[str, Any]], str]:
+    """Follow HTTP redirect chain and analyze each hop.
+
+    Args:
+        url: Starting URL to follow
+
+    Returns:
+        Tuple of (hops list, final HTML content)
+    """
+    session = _SESSION
     headers = {"User-Agent": "Mozilla/5.0 SentinelScope/1.0", "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.5"}
     hops, seen, final_html = [], set(), ""
     current = url
@@ -859,15 +930,8 @@ def chain_summary(chain: list[dict]) -> str:
     )
 
 
-def _parse_request_body() -> dict:
-    """Parse the JSON request body once and return it.
-
-    FIX 5 (cont.): Several routes called request.get_json(silent=True) two or
-    three times in the same request lifecycle.  While Flask caches the parsed
-    body, the repeated None-guard boilerplate scattered through route handlers
-    is noisy and error-prone.  Centralising it here also makes parse_analyze_url
-    consistent with the rest of the body consumption.
-    """
+def _parse_request_body() -> dict[str, Any]:
+    """Parse JSON request body, returning empty dict if invalid."""
     return request.get_json(silent=True) or {}
 
 
