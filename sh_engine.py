@@ -205,24 +205,26 @@ def trace_credentials(html: str, page_url: str) -> dict[str, Any]:
         resolved = urljoin(page_url, action) if action else page_url
         target_host = urlparse(resolved).hostname or page_host
         target_apex = _apex(target_host)
-        ff, low = [], resolved.lower()
+        low = resolved.lower()
         offsite = bool(target_apex) and target_apex != page_apex
         is_ip = bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", target_host or ""))
         to_tg = _TG_SHORT in low or _TG_HOST in low
         mailto = action.lower().startswith("mailto:")
         insecure = low.startswith("http://") and sensitive
-        if sensitive and to_tg:
-            ff.append("credentials posted to a messaging bot endpoint"); risk += 50
-        if sensitive and offsite and not to_tg:
-            ff.append(f"credentials sent off-site to {target_apex}"); risk += 35
-        if sensitive and is_ip:
-            ff.append("credentials sent to a raw IP address"); risk += 30
-        if sensitive and mailto:
-            ff.append("credentials emailed via mailto"); risk += 25
-        if insecure:
-            ff.append("password sent over unencrypted HTTP"); risk += 20
-        if sensitive and method == "GET":
-            ff.append("credentials placed in the URL (GET)"); risk += 15
+
+        cred_checks = [
+            (sensitive and to_tg, "credentials posted to a messaging bot endpoint", 50),
+            (sensitive and offsite and not to_tg, f"credentials sent off-site to {target_apex}", 35),
+            (sensitive and is_ip, "credentials sent to a raw IP address", 30),
+            (sensitive and mailto, "credentials emailed via mailto", 25),
+            (insecure, "password sent over unencrypted HTTP", 20),
+            (sensitive and method == "GET", "credentials placed in the URL (GET)", 15),
+        ]
+        ff = []
+        for cond, msg, pts in cred_checks:
+            if cond:
+                ff.append(msg)
+                risk += pts
         forms.append({
             "action": action or "(same page)", "resolved": resolved,
             "target": target_apex or "(self)", "method": method,
@@ -242,10 +244,16 @@ def detect_typosquat(host: str) -> dict[str, Any]:
     apex = _apex(host)
     label = apex.split(".")[0] if apex else ""
     findings, risk, flags = [], 0, []
-    if any(ord(ch) > 127 for ch in host):
-        flags.append("non-ASCII (Unicode) characters in domain"); risk += 40
-    if any(p.startswith("xn--") for p in host.split(".")):
-        flags.append("punycode/IDN domain (possible homoglyph spoof)"); risk += 25
+
+    checks = [
+        (any(ord(ch) > 127 for ch in host), "non-ASCII (Unicode) characters in domain", 40),
+        (any(p.startswith("xn--") for p in host.split(".")), "punycode/IDN domain (possible homoglyph spoof)", 25),
+    ]
+    for cond, msg, pts in checks:
+        if cond:
+            flags.append(msg)
+            risk += pts
+
     if apex in BRANDS:
         return {"available": True, "matches": [], "risk": risk, "flags": flags, "is_brand": True}
     skel = _skeleton(label)
